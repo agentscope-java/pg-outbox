@@ -16,10 +16,10 @@
     "events"
   ],
   "license": "MIT",
-  "author": "__AUTHOR__",
+  "author": "pg-outbox",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/__GH_OWNER__/pg-outbox.git"
+    "url": "git+https://github.com/agentscope-ai-java/pg-outbox.git"
   },
   "type": "module",
   "engines": {
