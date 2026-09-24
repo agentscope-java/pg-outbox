@@ -1,0 +1,51 @@
+{
+  "name": "pg-outbox",
+  "version": "0.1.0",
+  "description": "Transactional outbox for Postgres. Bring your own query function (pg, postgres.js, any ORM's transaction) — zero runtime dependencies. Multi-worker dispatch with FOR UPDATE SKIP LOCKED, per-key ordering, retries with backoff, and dead-lettering.",
+  "keywords": [
+    "outbox",
+    "transactional-outbox",
+    "postgres",
+    "postgresql",
+    "pg",
+    "queue",
+    "job-queue",
+    "skip-locked",
+    "dead-letter",
+    "at-least-once",
+    "events"
+  ],
+  "license": "MIT",
+  "author": "__AUTHOR__",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/__GH_OWNER__/pg-outbox.git"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=20.6.0"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "test": "node --test \"test/*.test.ts\"",
+    "typecheck": "tsc --noEmit",
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "demo": "node examples/concurrency-demo.ts",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build && npm run test:dist",
+    "test:dist": "node --test test/smoke.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.7.0"
+  }
+}
