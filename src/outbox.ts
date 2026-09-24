@@ -89,6 +89,18 @@ export interface Outbox {
    * then returns. Building block `dispatch` is written on top of; call it
    * directly if you want to drive the loop yourself (e.g. from a cron job or
    * a serverless function where a long-lived process isn't an option).
+   *
+   * Runs as one database transaction, from claim through every message's
+   * resolution (complete/retry/dead-letter), committing once at the end.
+   * This is not just bookkeeping: it's what keeps a claimed row's lock held
+   * for its *entire* time in-flight, which is what makes per-key
+   * exclusivity correct — see `claimSQL`'s doc comment and the README's
+   * "How claiming works" section. **This means the `query` this `Outbox`
+   * was constructed with must be bound to one stable connection/session** —
+   * the same requirement `enqueue` has for its `tx`, now extended to
+   * dispatch. A connection pool that hands out a different physical
+   * connection per call will silently run `BEGIN` and `COMMIT` on different
+   * sessions and defeat this — see the README for the failure mode.
    */
   processBatch(handler: (message: OutboxMessage) => Promise<void>, opts?: ProcessBatchOptions): Promise<ProcessResult>;
   /**
@@ -140,36 +152,66 @@ export function createOutbox(options: CreateOutboxOptions): Outbox {
     const batchSize = opts.batchSize ?? DEFAULT_BATCH_SIZE;
     const workerId = opts.workerId ?? defaultWorkerId();
 
-    const { rows } = await query(SQL.claim, [batchSize, workerId, table]);
-    const messages = rows.map(rowToMessage);
+    // Claim-through-resolution runs as one explicit transaction so each
+    // claimed row's lock (see claimSQL's `FOR UPDATE OF m SKIP LOCKED`) is
+    // held for its whole in-flight duration, not just the instant of the
+    // claim — see this function's doc comment for why that's load-bearing.
+    // `query` must therefore land every call below on the same session.
+    await query('BEGIN');
+    let messages: OutboxMessage[];
+    try {
+      const { rows } = await query(SQL.claim, [batchSize, workerId]);
+      messages = rows.map(rowToMessage);
 
-    // Every claimed message belongs to a distinct key (that's what `claim`
-    // guarantees), so processing the batch concurrently can never reorder two
-    // messages of the same key — it only overlaps independent keys.
-    const outcomes = await Promise.all(
-      messages.map(async (message) => {
-        try {
-          await handler(message);
+      // Every claimed message belongs to a distinct key (that's what `claim`
+      // guarantees), so running handlers concurrently can never reorder two
+      // messages of the same key — it only overlaps independent keys. The
+      // SQL calls each handler makes below (complete/retry/dead-letter) all
+      // land on the same connection regardless of handler timing, so they
+      // still serialize correctly within this one transaction; only once
+      // every message has settled do we decide whether to COMMIT or
+      // ROLLBACK, so no query is ever issued after that decision is made.
+      const outcomes = await Promise.allSettled(
+        messages.map(async (message) => {
+          try {
+            await handler(message);
+          } catch (err) {
+            opts.onError?.(err, message);
+            if (message.attempts >= message.maxAttempts) {
+              await query(SQL.deadLetter, [message.id, errorMessage(err)]);
+              return 'deadLettered' as const;
+            }
+            await query(SQL.retry, [message.id, String(backoff(message.attempts)), errorMessage(err)]);
+            return 'retried' as const;
+          }
           await query(SQL.complete, [message.id]);
           return 'succeeded' as const;
-        } catch (err) {
-          opts.onError?.(err, message);
-          if (message.attempts >= message.maxAttempts) {
-            await query(SQL.deadLetter, [message.id, errorMessage(err)]);
-            return 'deadLettered' as const;
-          }
-          await query(SQL.retry, [message.id, String(backoff(message.attempts)), errorMessage(err)]);
-          return 'retried' as const;
-        }
-      }),
-    );
+        }),
+      );
 
-    return {
-      claimed: messages.length,
-      succeeded: outcomes.filter((o) => o === 'succeeded').length,
-      retried: outcomes.filter((o) => o === 'retried').length,
-      deadLettered: outcomes.filter((o) => o === 'deadLettered').length,
-    };
+      const failed = outcomes.find((o) => o.status === 'rejected') as PromiseRejectedResult | undefined;
+      if (failed) throw failed.reason;
+
+      await query('COMMIT');
+
+      const values = (outcomes as PromiseFulfilledResult<'succeeded' | 'retried' | 'deadLettered'>[]).map(
+        (o) => o.value,
+      );
+      return {
+        claimed: messages.length,
+        succeeded: values.filter((v) => v === 'succeeded').length,
+        retried: values.filter((v) => v === 'retried').length,
+        deadLettered: values.filter((v) => v === 'deadLettered').length,
+      };
+    } catch (err) {
+      try {
+        await query('ROLLBACK');
+      } catch {
+        // the original error is what matters; a rollback failure (e.g. the
+        // connection already dropped) shouldn't mask it.
+      }
+      throw err;
+    }
   }
 
   async function dispatch(

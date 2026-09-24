@@ -16,6 +16,8 @@ function makeDb() {
   const notifications = [];
 
   const query = async (text, params = []) => {
+    const trimmed = text.trim();
+    if (trimmed === 'BEGIN' || trimmed === 'COMMIT' || trimmed === 'ROLLBACK') return { rows: [] };
     const tag = text.split('\n', 1)[0].trim();
     const now = Date.now();
     if (tag === '-- pg-outbox:schema') return { rows: [] };

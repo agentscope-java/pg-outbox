@@ -101,15 +101,34 @@ dependencies.
 export type Query = (text: string, params?: unknown[]) => Promise<{ rows: any[] }>;
 ```
 
-`pg`'s `pool.query` and `client.query` already have this shape. So does a
-transaction object from most ORMs' raw-query escape hatch. `postgres.js` uses
-tagged templates instead, so wrap it:
+`pg`'s `client.query` already has this shape. So does a transaction object
+from most ORMs' raw-query escape hatch. `postgres.js` uses tagged templates
+instead, so wrap it:
 
 ```ts
 import postgres from 'postgres';
 const sql = postgres(process.env.DATABASE_URL);
 const query: Query = (text, params = []) => sql.unsafe(text, params);
 ```
+
+**The `query` you pass to `createOutbox` must be bound to one stable
+connection/session — not a `pg.Pool`, whose `.query` hands a different
+physical connection to every call.** `processBatch` issues a literal
+`BEGIN`, the claim, every claimed message's resolution, and `COMMIT` as
+several separate calls to this function, and that only forms one real
+transaction if every call lands on the same session — see "How claiming
+works" below for why that transaction exists at all. Pass `pool.connect()`'s
+checked-out `client.query` (or an equivalent single-connection wrapper), not
+`pool.query`.
+
+**The failure mode if you get this wrong is silent, not an error.** A pool
+will happily run `BEGIN` on connection A and the claim on connection B — no
+exception, no warning, just two unrelated autocommitted statements and a row
+lock that never actually spans the batch. Per-key exclusivity quietly stops
+holding under load; nothing in the code path will tell you, which is exactly
+the shape of bug this library's own claim query shipped with once already
+(see "How claiming works"). If you're not sure whether your `query` is
+pool-backed, it probably is — check.
 
 ### Enqueue — inside your transaction
 
@@ -164,45 +183,80 @@ then returns.
 This is the load-bearing SQL (`src/sql.ts`'s `claimSQL`, abbreviated):
 
 ```sql
-WITH locked AS (
-  SELECT t.id, t.key
-  FROM outbox_messages t
-  WHERE t.status = 'pending'
-    AND t.available_at <= now()
-    AND NOT EXISTS (
-      SELECT 1 FROM outbox_messages p WHERE p.key = t.key AND p.status = 'processing'
-    )
-    AND pg_try_advisory_xact_lock(hashtext($3), hashtext(t.key))
-  ORDER BY t.id
-  FOR UPDATE SKIP LOCKED
+WITH candidates AS (
+  SELECT DISTINCT ON (key) id
+  FROM outbox_messages
+  WHERE status = 'pending' AND available_at <= now()
+  ORDER BY key, id
 ),
-head AS (
-  SELECT DISTINCT ON (key) id FROM locked ORDER BY key, id LIMIT $1
+locked AS (
+  SELECT m.id
+  FROM outbox_messages m
+  JOIN candidates c ON c.id = m.id
+  ORDER BY m.id
+  LIMIT $1
+  FOR UPDATE OF m SKIP LOCKED
 )
 UPDATE outbox_messages m SET status = 'processing', attempts = m.attempts + 1, ...
-FROM head WHERE m.id = head.id
+FROM locked WHERE m.id = locked.id
 RETURNING m.*;
 ```
 
-Three mechanisms, doing three different jobs:
+`processBatch` runs this as the first statement of an explicit transaction
+(`BEGIN` ... claim ... handle each message ... complete/retry/dead-letter
+each one ... `COMMIT`) that stays open until every claimed message in the
+batch is resolved. That's not incidental — it's the fix for a real
+correctness bug an earlier version of this query had, caught only because
+this package's own regression test (`test/concurrency-regression.test.ts`)
+runs against a real Postgres under real concurrent load rather than relying
+on the in-memory fake or small-scale checks alone. Worth explaining both
+halves:
 
-- **`FOR UPDATE SKIP LOCKED`** is what lets several dispatchers run against the
-  same table concurrently without double-delivering or blocking each other. If
-  another transaction already has a candidate row locked, this query skips it
-  instead of waiting behind it — so N dispatchers polling the same table
-  degrade to "each gets a share of the work," not "each waits for the others."
-- **`NOT EXISTS (... status = 'processing')`** is what makes per-key ordering
-  hold for the *entire* time a message is in flight, not just the instant it's
-  claimed: once a message is marked `processing`, every other message with the
-  same `key` is invisible to every claim query — including this one, later —
-  until that message resolves (succeeds, is retried, or is dead-lettered).
-- **`pg_try_advisory_xact_lock(hashtext($3), hashtext(t.key))`** closes a
-  narrower race: two dispatchers running this query at the *same instant*
-  against a key whose first message isn't committed as `processing` yet. The
-  advisory lock is per-key, held for the statement's duration, and excludes
-  every row of that key (not just the specific one being raced over) from the
-  loser's candidate set — so the loser's query can't fall through to a
-  *later* message of that key and hand it out of order.
+**What `candidates` does.** For each key, it picks exactly one row — the
+oldest `pending` one — using a normal MVCC-snapshot read. This is where a
+key's "next message" gets decided, and critically, it's decided *before*
+anything tries to lock anything.
+
+**What `locked` does.** It tries to lock *only those chosen rows*, live, via
+`FOR UPDATE OF m SKIP LOCKED`. If a key's chosen row is currently locked —
+another transaction claimed it and hasn't resolved it yet — that row is
+dropped. Because `candidates` already committed to exactly one row per key
+before any locking happened, there's no second row for `locked` to fall back
+to: a key whose head message is in flight contributes *nothing* to this
+batch. And because holding the whole claim-through-resolution cycle inside
+one transaction keeps that row's lock held for the message's entire
+in-flight duration (not just the instant it's claimed), this exclusion holds
+for as long as the message takes to process, however long that is.
+
+**The bug this replaced.** An earlier version used `NOT EXISTS (SELECT 1
+... WHERE status = 'processing')` to detect in-flight siblings, protected by
+an advisory lock (`pg_try_advisory_xact_lock`) that was released the moment
+the *claim* transaction committed — which, since claiming was its own short
+autocommit statement, was almost immediately, long before the handler
+actually finished. That combination is subtly broken: Postgres's
+`READ COMMITTED` isolation takes one snapshot per *statement*, at the
+statement's start, not per row as it scans. If worker B's claim statement
+started before worker A committed row 1 as `processing`, B's `NOT EXISTS`
+check — evaluated later, possibly *after* A had already committed and
+released its advisory lock — still saw the pre-commit state and happily
+claimed row 2 of the same key. The window only opens when a scan takes long
+enough for another transaction to fully claim-and-commit inside it, which is
+exactly why it never showed up in quick, few-row tests and only appeared
+under real concurrent load against real Postgres: a regression test with 6
+workers, 25 keys and 500 messages (`test/concurrency-regression.test.ts`)
+reproduced the old query failing with **8 same-key concurrency violations**
+on one run and **2 on a second run** (violations are counted across the
+whole 500-message run, not stopped at the first one) — the fixed query
+(above) passed the identical test **five consecutive times with zero
+violations of either kind (same-key overlap or ordering)**. A
+`FOR UPDATE ... SKIP LOCKED` check is never snapshot-stale like that, which
+is why the fix routes through it instead of a status column.
+
+**What this means for you:** the `query` this library is constructed with
+must be bound to one stable connection/session for dispatch — see the
+prominent warning under "Use" above. A connection pool that hands a
+different physical connection to each call will run `BEGIN` and `COMMIT` on
+different sessions and silently lose this guarantee.
 
 ## Ordering
 
@@ -227,6 +281,17 @@ idempotent** — safe to run twice with the same message. `msg.id` is a stable
 identifier included on every message specifically so you can deduplicate on
 it (e.g. a `processed_message_ids` table, an idempotency key your broker or
 downstream API already supports).
+
+Because `processBatch` holds one open transaction across the whole batch
+(see "How claiming works" above), a worker process dying mid-batch rolls the
+*entire* batch back automatically — every claim in it reverts to `pending`,
+with nothing stuck as `processing` forever and nothing left for a reaper to
+clean up. The trade-off: if message 1 of a 5-message batch already
+succeeded (published, in your handler's eyes) when the process died on
+message 3, message 1 redelivers too, since its completion was never
+committed either. Still at-least-once, never zero-delivery — just a
+batch-sized blast radius for that specific redelivery, not a single-message
+one. Smaller `batchSize` values shrink that radius.
 
 ## Retries, backoff, and dead-lettering
 
@@ -359,14 +424,22 @@ invariants the real SQL does (see that file's doc comment) — no database
 needed for full coverage of dispatch, retries, backoff, dead-lettering, and
 concurrent-worker ordering.
 
-`test/integration.test.ts` runs against a real Postgres when one is reachable
-(`DATABASE_URL`, or `postgres://postgres@127.0.0.1:5432/postgres` by default)
-and **skips explicitly, with the reason printed**, when it isn't:
+`test/integration.test.ts` and `test/concurrency-regression.test.ts` run
+against a real Postgres when one is reachable (`DATABASE_URL`, or
+`postgres://postgres@127.0.0.1:5432/postgres` by default) and **skip
+explicitly, with the reason printed**, when it isn't:
 
 ```
 [integration] SKIPPING: No reachable Postgres at postgres://postgres@127.0.0.1:5432/postgres
 (connect ECONNREFUSED 127.0.0.1:5432). Set DATABASE_URL to run the integration suite for real.
 ```
+
+`test/concurrency-regression.test.ts` is the large-scale regression test for
+the claim-query bug described in "How claiming works": 6 concurrent workers,
+25 keys, 500 messages, asserting zero same-key overlaps and zero ordering
+violations. It genuinely needs a real Postgres and real concurrent
+connections — the bug it guards against never reproduced against the
+in-memory fake or at small scale.
 
 It connects with a small hand-rolled wire-protocol client
 (`test/helpers/pg-wire.ts`) rather than a driver, since devDependencies are

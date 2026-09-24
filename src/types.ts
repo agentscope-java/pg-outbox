@@ -1,8 +1,18 @@
 /**
  * The one thing this library needs from your database driver: something that
- * runs parameterized SQL and hands back rows. `pg`'s `pool.query`/`client.query`,
- * `postgres.js` wrapped in `sql.unsafe`, and most ORMs' raw-query escape hatches
- * all satisfy this shape already — see the README for adapters.
+ * runs parameterized SQL and hands back rows. `pg`'s `client.query`,
+ * `postgres.js` wrapped in `sql.unsafe`, and most ORMs' raw-query escape
+ * hatches all satisfy this shape already — see the README for adapters.
+ *
+ * **The `query` passed to `createOutbox` must be bound to one stable
+ * connection/session — not a `pg.Pool`, whose `.query` hands out a
+ * different physical connection per call.** `processBatch` issues a literal
+ * `BEGIN`, the claim, every claimed message's resolution, and `COMMIT` as
+ * several calls to this function; that only holds together as one
+ * transaction if they all land on the same session. See the README's "How
+ * claiming works" section for why, and what a pool does wrong here (it
+ * won't throw — it silently runs `BEGIN`/`COMMIT` on different connections
+ * and loses the per-key exclusivity guarantee this library exists for).
  */
 export type Query = (text: string, params?: unknown[]) => Promise<{ rows: any[] }>;
 
@@ -75,7 +85,11 @@ export interface DispatchOptions extends ProcessBatchOptions {
 export type ListenFn = (channel: string, onNotify: () => void) => Promise<() => Promise<void>>;
 
 export interface CreateOutboxOptions {
-  /** Runs SQL and returns rows. Used for dispatch, retries, and schema creation — not for `enqueue`. */
+  /**
+   * Runs SQL and returns rows. Used for dispatch, retries, and schema
+   * creation — not for `enqueue`. Must be bound to one stable
+   * connection/session, not a pool — see `Query`'s doc comment.
+   */
   query: Query;
   /** Table name. Default `outbox_messages`. Must be a bare identifier. */
   table?: string;

@@ -61,50 +61,52 @@ SELECT pg_notify($1, $2);`;
 /**
  * Claims up to `$1` messages, at most one per distinct `key`.
  *
- * Three mechanisms, layered:
+ * **Must be run as the first statement of an explicit transaction that
+ * stays open until every claimed message is resolved** (`processBatch`
+ * wraps itself in `BEGIN`/`COMMIT` for exactly this reason — see its doc
+ * comment). Two CTEs, two different jobs:
  *
- * 1. `NOT EXISTS (... status = 'processing')` — a key with a message already
- *    in flight is skipped entirely, for as long as that message is in flight
- *    (this is what makes ordering durable across the whole processing time,
- *    not just the instant of the claim).
- * 2. `pg_try_advisory_xact_lock` — closes the narrow race where two workers
- *    run this query concurrently against the *same* key's first-ever pending
- *    message: whichever worker's query reaches that key first holds the lock
- *    for the rest of this statement, so the other worker's query excludes
- *    every row of that key rather than falling through to a later one.
- * 3. `FOR UPDATE SKIP LOCKED` — the standard non-blocking claim: if another
- *    concurrent statement already has a candidate row locked, this query skips
- *    it and moves on instead of blocking behind it. This is what lets several
- *    dispatchers run against the same table without serializing on each other.
+ * - `candidates` picks *one specific row id* per key — the oldest pending
+ *   one — using an ordinary MVCC-snapshot read. This is where a key's
+ *   "next message" gets decided, and critically, it's decided before
+ *   anything tries to lock anything.
+ * - `locked` then tries to lock *only those chosen rows*, live, via
+ *   `FOR UPDATE OF m SKIP LOCKED`. If a key's chosen row is currently
+ *   locked — another transaction claimed it and hasn't resolved it yet —
+ *   that row is dropped. Because `candidates` already committed to exactly
+ *   one row per key before any locking happened, there's no second row for
+ *   `locked` to fall back to: a key whose head message is in flight
+ *   contributes *nothing* to this batch. Row-lock checks are never
+ *   snapshot-stale the way a `status` column read can be, which is what
+ *   makes this exclusion hold regardless of how long the scan takes or how
+ *   busy the table is — see the README's "How claiming works" section for
+ *   the bug this replaced, and the numbers that exposed it.
  */
 export function claimSQL(table: string): string {
   const t = quoted(table);
   return `-- pg-outbox:claim
-WITH locked AS (
-  SELECT t.id, t.key
-  FROM ${t} t
-  WHERE t.status = 'pending'
-    AND t.available_at <= now()
-    AND NOT EXISTS (
-      SELECT 1 FROM ${t} p WHERE p.key = t.key AND p.status = 'processing'
-    )
-    AND pg_try_advisory_xact_lock(hashtext($3), hashtext(t.key))
-  ORDER BY t.id
-  FOR UPDATE SKIP LOCKED
-),
-head AS (
+WITH candidates AS (
   SELECT DISTINCT ON (key) id
-  FROM locked
+  FROM ${t}
+  WHERE status = 'pending'
+    AND available_at <= now()
   ORDER BY key, id
+),
+locked AS (
+  SELECT m.id
+  FROM ${t} m
+  JOIN candidates c ON c.id = m.id
+  ORDER BY m.id
   LIMIT $1
+  FOR UPDATE OF m SKIP LOCKED
 )
 UPDATE ${t} m
 SET status = 'processing',
     attempts = m.attempts + 1,
     locked_at = now(),
     locked_by = $2
-FROM head
-WHERE m.id = head.id
+FROM locked
+WHERE m.id = locked.id
 RETURNING m.id, m.key, m.topic, m.payload, m.attempts, m.max_attempts, m.created_at;`;
 }
 

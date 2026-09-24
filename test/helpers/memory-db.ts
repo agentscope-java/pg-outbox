@@ -7,8 +7,13 @@
  *
  *   - claim: at most one row per distinct `key`, and never a key that already
  *     has a `processing` row — the same guarantee `claimSQL`'s
- *     `NOT EXISTS (... status = 'processing')` plus `FOR UPDATE SKIP LOCKED`
- *     gives you against real Postgres.
+ *     `candidates`/`locked` CTEs plus `FOR UPDATE OF m SKIP LOCKED` give you
+ *     against real Postgres. This fake enforces it "for free" by resolving
+ *     each `query()` call synchronously (see below) rather than by locking,
+ *     so it was never subject to the snapshot-staleness bug the real SQL
+ *     had before `locked`'s live row-lock check replaced the old
+ *     `NOT EXISTS (... status = 'processing')` read — see the README's "How
+ *     claiming works" section.
  *   - `available_at` gates claiming, so backoff delays are honored.
  *   - `complete`/`retry`/`dead-letter` mutate exactly the row they're given.
  *
@@ -42,6 +47,17 @@ export class MemoryDb {
   #subscribers = new Map<string, Set<() => void>>();
 
   query: Query = async (text, params = []) => {
+    const trimmed = text.trim();
+    if (trimmed === 'BEGIN' || trimmed === 'COMMIT' || trimmed === 'ROLLBACK') {
+      // MemoryDb enforces claim exclusivity synchronously within #claim
+      // itself (see that method's doc comment), so it has no concept of a
+      // multi-statement open transaction to simulate — these are no-ops
+      // here. `processBatch` still issues them (matching what it sends
+      // real Postgres), which is exactly what exercises that any real
+      // `query` function passed to this library must tolerate literal
+      // BEGIN/COMMIT/ROLLBACK text landing on the same session.
+      return { rows: [] };
+    }
     const tag = (text.split('\n', 1)[0] ?? '').trim();
     switch (tag) {
       case '-- pg-outbox:schema':
